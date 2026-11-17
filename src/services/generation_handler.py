@@ -35,6 +35,10 @@ def _video_poll_attempt_budget(
 
 # 账号配额耗尽/风控时，单个请求最多尝试的账号数（含首个账号）
 MAX_TOKEN_FAILOVER_ATTEMPTS = 6
+LOW_PRIORITY_SUFFIX = "_low_priority"
+# Set when a Lower Priority job lowered an account's credits; blocks further
+# Lower Priority jobs until restart so a "free" model cannot keep spending.
+_LOW_PRIORITY_HALT: Dict[str, Optional[str]] = {"reason": None}
 # 其中因风控 (UNUSUAL_ACTIVITY) 失败的账号数上限：每次风控要耗费两轮打码，
 # 而配额耗尽的账号会立即失败，不占用这部分额度
 MAX_RISK_FAILOVER_ATTEMPTS = 3
@@ -1201,6 +1205,42 @@ def _apply_current_flow_model_catalog():
                 f"Veo 3.1 - Lite · {seconds}s · {orientation}",
             )
 
+    # Veo 3.1 Lite [Lower Priority]: 0 credits, Ultra $200 subscribers and family
+    # managers only. Key = paid Lite key + "_low_priority" (captured live
+    # 2026-11-17: t2v 4s/6s via YhhmEf, r2v via MZZa6b, start+end 4s via nprQif).
+    # Never falls back to the paid key: a free request must not spend credits.
+    def low(config_entry: Dict[str, Any]) -> Dict[str, Any]:
+        config_entry["model_key"] = config_entry["model_key"] + LOW_PRIORITY_SUFFIX
+        config_entry["low_priority"] = True
+        return config_entry
+
+    for seconds, key in (
+        (4, "veo_3_1_t2v_lite_4s"),
+        (6, "veo_3_1_t2v_lite_6s"),
+        (8, "veo_3_1_t2v_lite"),
+    ):
+        for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
+            register(
+                f"veo-3.1-lite-low-{seconds}s-{orientation}",
+                low(t2v(key, ratio)),
+                f"Veo 3.1 - Lite [Lower Priority] · {seconds}s · {orientation}",
+            )
+            if seconds == 8:
+                continue
+            # 1 image = start frame (the "_fl" is stripped), 2 = start + end.
+            register(
+                f"veo-3.1-lite-low-i2v-{seconds}s-{orientation}",
+                low(i2v(f"veo_3_1_i2v_s_lite_{seconds}s_fl", ratio)),
+                f"Veo 3.1 - Lite [Lower Priority] I2V · {seconds}s · {orientation}",
+            )
+
+    for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
+        register(
+            f"veo-3.1-lite-low-r2v-8s-{orientation}",
+            low(r2v("veo_3_1_r2v_lite", ratio)),
+            f"Veo 3.1 - Lite [Lower Priority] R2V · 8s · {orientation}",
+        )
+
     # Veo 3.1 Fast. Current 4s/6s consumer access uses relaxed usage keys.
     for seconds, landscape_key, portrait_key in (
         (4, "veo_3_1_t2v_fast_4s_relaxed", "veo_3_1_t2v_fast_4s_relaxed"),
@@ -1660,6 +1700,12 @@ class GenerationHandler:
 
         model_config = MODEL_CONFIG[model]
         generation_type = model_config["type"]
+        if model_config.get("low_priority") and _LOW_PRIORITY_HALT["reason"]:
+            error_msg = f"Lower Priority models halted: {_LOW_PRIORITY_HALT['reason']}"
+            debug_logger.log_error(f"[LOW_PRIORITY] {error_msg}")
+            record_generation_result("video", "failed", time.time() - start_time)
+            yield self._create_error_response(error_msg, status_code=503)
+            return
         video_type_for_op = model_config.get("video_type", "")
         request_operation = (
             "extend_video"
@@ -1876,6 +1922,12 @@ class GenerationHandler:
                         yield chunk
                 else:  # video
                     debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
+                    low_priority = bool(model_config.get("low_priority"))
+                    credits_before = (
+                        await self._read_low_priority_credits(token)
+                        if low_priority
+                        else None
+                    )
                     async for chunk in self._handle_video_generation(
                         token,
                         project_id,
@@ -1891,6 +1943,10 @@ class GenerationHandler:
                         video_media_id=video_media_id,
                     ):
                         yield chunk
+                    if low_priority and generation_result.get("success"):
+                        await self._check_low_priority_credits(
+                            token, model, credits_before
+                        )
                 perf_trace["generation_pipeline_ms"] = int(
                     (time.time() - generation_pipeline_started_at) * 1000
                 )
@@ -2121,6 +2177,39 @@ class GenerationHandler:
     def _is_quota_exhausted_error(error: Exception) -> bool:
         """账号配额耗尽：换一个账号通常可以成功。"""
         return "public_error_user_quota_reached" in str(error or "").lower()
+
+    async def _read_low_priority_credits(self, token) -> Optional[int]:
+        """Live credit balance before a Lower Priority job; None if unreadable."""
+        try:
+            return int(
+                await asyncio.wait_for(
+                    self.token_manager.refresh_credits(token.id, raise_on_error=True),
+                    timeout=15,
+                )
+            )
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[LOW_PRIORITY] Token {token.id} credit read failed, "
+                f"job runs unverified: {str(e)[:200]}"
+            )
+            return None
+
+    async def _check_low_priority_credits(
+        self, token, model: str, credits_before: Optional[int]
+    ) -> None:
+        """Halt Lower Priority models if a job lowered the account's credits."""
+        if credits_before is None:
+            return
+        credits_after = await self._read_low_priority_credits(token)
+        if credits_after is None or credits_after >= credits_before:
+            return
+        reason = (
+            f"{model} on token {token.id} spent "
+            f"{credits_before - credits_after} credits "
+            f"({credits_before} -> {credits_after})"
+        )
+        _LOW_PRIORITY_HALT["reason"] = reason
+        debug_logger.log_error(f"[LOW_PRIORITY] {reason}; halted until restart")
 
     async def _refresh_token_credits(self, token) -> Optional[int]:
         """配额耗尽后刷新并落库余额，作为冷却解除的基准；失败时退回已知余额。"""

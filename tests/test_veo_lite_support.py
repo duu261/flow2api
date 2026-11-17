@@ -518,6 +518,128 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class VeoLiteLowPriorityTests(unittest.IsolatedAsyncioTestCase):
+    """Lower Priority Lite: free key = paid key + _low_priority, no paid fallback."""
+
+    async def asyncSetUp(self):
+        from src.services import generation_handler as gh
+
+        self.gh = gh
+        gh._LOW_PRIORITY_HALT["reason"] = None
+        self.client = FlowClient(proxy_manager=None)
+        self.client._acquire_video_launch_gate = AsyncMock(
+            return_value=(True, None, None)
+        )
+        self.client._release_video_launch_gate = AsyncMock()
+        self.client._get_recaptcha_token = AsyncMock(
+            return_value=("recaptcha-token", "browser-1")
+        )
+        self.client._notify_browser_captcha_request_finished = AsyncMock()
+        self.client._notify_browser_captcha_error = AsyncMock()
+
+    async def asyncTearDown(self):
+        self.gh._LOW_PRIORITY_HALT["reason"] = None
+
+    def test_catalog_keys_match_live_captures(self):
+        listed = {item["id"] for item in _get_openai_model_catalog()}
+        expected = {
+            "veo-3.1-lite-low-4s-landscape": "veo_3_1_t2v_lite_4s_low_priority",
+            "veo-3.1-lite-low-6s-portrait": "veo_3_1_t2v_lite_6s_low_priority",
+            "veo-3.1-lite-low-8s-landscape": "veo_3_1_t2v_lite_low_priority",
+            "veo-3.1-lite-low-r2v-8s-portrait": "veo_3_1_r2v_lite_low_priority",
+            "veo-3.1-lite-low-i2v-4s-landscape": "veo_3_1_i2v_s_lite_4s_fl_low_priority",
+            "veo-3.1-lite-low-i2v-6s-portrait": "veo_3_1_i2v_s_lite_6s_fl_low_priority",
+        }
+        for model_id, key in expected.items():
+            with self.subTest(model=model_id):
+                self.assertIn(model_id, listed)
+                self.assertEqual(
+                    resolve_model_name(model_id, model_config=MODEL_CONFIG), model_id
+                )
+                cfg = MODEL_CONFIG[model_id]
+                self.assertEqual(cfg["model_key"], key)
+                self.assertTrue(cfg["low_priority"])
+                self.assertFalse(cfg["allow_tier_upgrade"])
+        # Paid Lite entries are untouched.
+        self.assertEqual(
+            MODEL_CONFIG["veo-3.1-lite-4s-landscape"]["model_key"],
+            "veo_3_1_t2v_lite_4s",
+        )
+        self.assertNotIn("low_priority", MODEL_CONFIG["veo-3.1-lite-4s-landscape"])
+
+    def test_tier_two_keeps_low_priority_key(self):
+        handler = GenerationHandler.__new__(GenerationHandler)
+        for model_id in (
+            "veo-3.1-lite-low-4s-landscape",
+            "veo-3.1-lite-low-i2v-4s-landscape",
+            "veo-3.1-lite-low-r2v-8s-landscape",
+        ):
+            key, message = handler._resolve_video_model_key_for_tier(
+                MODEL_CONFIG[model_id], "PAYGATE_TIER_TWO"
+            )
+            self.assertEqual(key, MODEL_CONFIG[model_id]["model_key"])
+            self.assertIsNone(message)
+
+    async def test_missing_low_priority_key_never_falls_back_to_paid(self):
+        self.client._call_flow_frontend_rpc = AsyncMock(
+            side_effect=RuntimeError("Flow frontend RPC rejected: rpc=YhhmEf, code=[5]")
+        )
+        with patch("src.services.flow_client.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(RuntimeError):
+                await self.client.generate_video_text(
+                    at="at-token",
+                    project_id="22222222-2222-2222-2222-222222222222",
+                    prompt="ocean",
+                    model_key="veo_3_1_t2v_lite_8s_low_priority",
+                    aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+                    use_v2_model_config=True,
+                    google_cookies="SID=session-cookie",
+                )
+        sent = {
+            call.kwargs["argument"][0][0][1]
+            for call in self.client._call_flow_frontend_rpc.await_args_list
+        }
+        self.assertEqual(sent, {"veo_3_1_t2v_lite_8s_low_priority"})
+
+    def _handler_with_credits(self, *balances):
+        handler = GenerationHandler.__new__(GenerationHandler)
+        handler.token_manager = types.SimpleNamespace(
+            refresh_credits=AsyncMock(side_effect=list(balances))
+        )
+        return handler
+
+    async def test_credit_drop_halts_low_priority(self):
+        token = types.SimpleNamespace(id=7)
+        handler = self._handler_with_credits(25050, 25045)
+        before = await handler._read_low_priority_credits(token)
+        await handler._check_low_priority_credits(token, "veo-3.1-lite-low-4s-landscape", before)
+        self.assertIn("spent 5 credits", self.gh._LOW_PRIORITY_HALT["reason"])
+
+        handler.token_manager = types.SimpleNamespace(refresh_credits=AsyncMock())
+        handler.flow_client = types.SimpleNamespace()
+        chunks = [
+            chunk
+            async for chunk in handler.handle_generation(
+                "veo-3.1-lite-low-4s-landscape", "ocean"
+            )
+        ]
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("halted", chunks[0])
+        handler.token_manager.refresh_credits.assert_not_awaited()
+
+    async def test_unchanged_or_unreadable_credits_do_not_halt(self):
+        token = types.SimpleNamespace(id=7)
+        handler = self._handler_with_credits(25050, 25050)
+        before = await handler._read_low_priority_credits(token)
+        await handler._check_low_priority_credits(token, "m", before)
+        self.assertIsNone(self.gh._LOW_PRIORITY_HALT["reason"])
+
+        handler = self._handler_with_credits(RuntimeError("boom"))
+        self.assertIsNone(await handler._read_low_priority_credits(token))
+        await handler._check_low_priority_credits(token, "m", None)
+        self.assertIsNone(self.gh._LOW_PRIORITY_HALT["reason"])
+
+
 class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = FlowClient(proxy_manager=None)
