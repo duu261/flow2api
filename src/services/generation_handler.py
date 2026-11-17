@@ -39,6 +39,26 @@ LOW_PRIORITY_SUFFIX = "_low_priority"
 # Set when a Lower Priority job lowered an account's credits; blocks further
 # Lower Priority jobs until restart so a "free" model cannot keep spending.
 _LOW_PRIORITY_HALT: Dict[str, Optional[str]] = {"reason": None}
+# Per token: [paid jobs in flight, paid jobs started]. A credit drop during a
+# Lower Priority job is only blamed on it when no paid job overlapped.
+_PAID_ACTIVITY: Dict[Any, List[int]] = {}
+
+
+def _paid_job_started(token_id) -> None:
+    activity = _PAID_ACTIVITY.setdefault(token_id, [0, 0])
+    activity[0] += 1
+    activity[1] += 1
+
+
+def _paid_job_finished(token_id) -> None:
+    activity = _PAID_ACTIVITY.get(token_id)
+    if activity:
+        activity[0] = max(0, activity[0] - 1)
+
+
+def _paid_snapshot(token_id) -> tuple:
+    activity = _PAID_ACTIVITY.get(token_id, [0, 0])
+    return activity[0], activity[1]
 # 其中因风控 (UNUSUAL_ACTIVITY) 失败的账号数上限：每次风控要耗费两轮打码，
 # 而配额耗尽的账号会立即失败，不占用这部分额度
 MAX_RISK_FAILOVER_ATTEMPTS = 3
@@ -1904,49 +1924,55 @@ class GenerationHandler:
 
                 # 5. 根据类型处理
                 generation_pipeline_started_at = time.time()
-                if generation_type == "image":
-                    debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
-                    async for chunk in self._handle_image_generation(
-                        token,
-                        project_id,
-                        model_config,
-                        prompt,
-                        images,
-                        stream,
-                        perf_trace=perf_trace,
-                        generation_result=generation_result,
-                        response_state=response_state,
-                        request_log_state=request_log_state,
-                        pending_token_state=pending_token_state,
-                    ):
-                        yield chunk
-                else:  # video
-                    debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
-                    low_priority = bool(model_config.get("low_priority"))
-                    credits_before = (
-                        await self._read_low_priority_credits(token)
-                        if low_priority
-                        else None
+                low_priority = bool(model_config.get("low_priority"))
+                credits_before = None
+                paid_before = None
+                if low_priority:
+                    paid_before = _paid_snapshot(token.id)
+                    credits_before = await self._read_low_priority_credits(token)
+                else:
+                    _paid_job_started(token.id)
+                try:
+                    if generation_type == "image":
+                        debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
+                        async for chunk in self._handle_image_generation(
+                            token,
+                            project_id,
+                            model_config,
+                            prompt,
+                            images,
+                            stream,
+                            perf_trace=perf_trace,
+                            generation_result=generation_result,
+                            response_state=response_state,
+                            request_log_state=request_log_state,
+                            pending_token_state=pending_token_state,
+                        ):
+                            yield chunk
+                    else:  # video
+                        debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
+                        async for chunk in self._handle_video_generation(
+                            token,
+                            project_id,
+                            model_config,
+                            prompt,
+                            images,
+                            stream,
+                            perf_trace=perf_trace,
+                            generation_result=generation_result,
+                            response_state=response_state,
+                            request_log_state=request_log_state,
+                            pending_token_state=pending_token_state,
+                            video_media_id=video_media_id,
+                        ):
+                            yield chunk
+                finally:
+                    if not low_priority:
+                        _paid_job_finished(token.id)
+                if low_priority and generation_result.get("success"):
+                    await self._check_low_priority_credits(
+                        token, model, credits_before, paid_before
                     )
-                    async for chunk in self._handle_video_generation(
-                        token,
-                        project_id,
-                        model_config,
-                        prompt,
-                        images,
-                        stream,
-                        perf_trace=perf_trace,
-                        generation_result=generation_result,
-                        response_state=response_state,
-                        request_log_state=request_log_state,
-                        pending_token_state=pending_token_state,
-                        video_media_id=video_media_id,
-                    ):
-                        yield chunk
-                    if low_priority and generation_result.get("success"):
-                        await self._check_low_priority_credits(
-                            token, model, credits_before
-                        )
                 perf_trace["generation_pipeline_ms"] = int(
                     (time.time() - generation_pipeline_started_at) * 1000
                 )
@@ -2195,7 +2221,11 @@ class GenerationHandler:
             return None
 
     async def _check_low_priority_credits(
-        self, token, model: str, credits_before: Optional[int]
+        self,
+        token,
+        model: str,
+        credits_before: Optional[int],
+        paid_before: Optional[tuple] = None,
     ) -> None:
         """Halt Lower Priority models if a job lowered the account's credits."""
         if credits_before is None:
@@ -2203,6 +2233,16 @@ class GenerationHandler:
         credits_after = await self._read_low_priority_credits(token)
         if credits_after is None or credits_after >= credits_before:
             return
+        if paid_before is not None:
+            in_flight_before, started_before = paid_before
+            in_flight_after, started_after = _paid_snapshot(token.id)
+            if in_flight_before or in_flight_after or started_after != started_before:
+                debug_logger.log_warning(
+                    f"[LOW_PRIORITY] Token {token.id} credits dropped "
+                    f"{credits_before} -> {credits_after} while a paid job overlapped; "
+                    "not attributed to the free job"
+                )
+                return
         reason = (
             f"{model} on token {token.id} spent "
             f"{credits_before - credits_after} credits "

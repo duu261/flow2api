@@ -627,6 +627,22 @@ class VeoLiteLowPriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("halted", chunks[0])
         handler.token_manager.refresh_credits.assert_not_awaited()
 
+    async def test_drop_during_overlapping_paid_job_does_not_halt(self):
+        token = types.SimpleNamespace(id=9)
+        handler = self._handler_with_credits(25050, 25026)
+        paid_before = self.gh._paid_snapshot(token.id)
+        before = await handler._read_low_priority_credits(token)
+        self.gh._paid_job_started(token.id)
+        self.gh._paid_job_finished(token.id)
+        await handler._check_low_priority_credits(token, "m", before, paid_before)
+        self.assertIsNone(self.gh._LOW_PRIORITY_HALT["reason"])
+
+        handler = self._handler_with_credits(25026, 25021)
+        paid_before = self.gh._paid_snapshot(token.id)
+        before = await handler._read_low_priority_credits(token)
+        await handler._check_low_priority_credits(token, "m", before, paid_before)
+        self.assertIn("spent 5 credits", self.gh._LOW_PRIORITY_HALT["reason"])
+
     async def test_unchanged_or_unreadable_credits_do_not_halt(self):
         token = types.SimpleNamespace(id=7)
         handler = self._handler_with_credits(25050, 25050)
